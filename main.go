@@ -18,17 +18,13 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
-// Build information (set by build script)
 var (
 	Version   = "dev"
 	BuildTime = "unknown"
 	GoVersion = "unknown"
 )
-
-// ==================== MATHEMATICAL FOUNDATION ====================
 
 type Vector2D struct {
 	X, Y float64
@@ -36,6 +32,15 @@ type Vector2D struct {
 
 func NewVector2D(x, y float64) Vector2D {
 	return Vector2D{X: x, Y: y}
+}
+
+func (v Vector2D) Normalize() Vector2D {
+	magSq := v.X*v.X + v.Y*v.Y
+	if magSq == 0 {
+		return Vector2D{}
+	}
+	invMag := float64(fastInvSqrt(float32(magSq)))
+	return Vector2D{X: v.X * invMag, Y: v.Y * invMag}
 }
 
 func (v1 Vector2D) Add(v2 Vector2D) Vector2D {
@@ -51,50 +56,41 @@ func (v Vector2D) Scale(factor float64) Vector2D {
 }
 
 func (v Vector2D) Dot(other Vector2D) float64 {
-	return v.X*other.X + v.Y*other.Y
+	return math.FMA(v.X, other.X, v.Y*other.Y)
 }
 
 func (v Vector2D) Cross(other Vector2D) float64 {
-	return v.X*other.Y - v.Y*other.X
-}
-
-func (v Vector2D) Magnitude() float64 {
-	return math.Sqrt(v.X*v.X + v.Y*v.Y)
+	return math.FMA(v.X, other.Y, -v.Y*other.X)
 }
 
 func (v Vector2D) MagnitudeSquared() float64 {
 	return v.X*v.X + v.Y*v.Y
 }
 
-func (v Vector2D) Normalize() Vector2D {
-	mag := v.Magnitude()
-	if mag == 0 {
-		return Vector2D{}
-	}
-	invMag := 1.0 / mag
-	return Vector2D{X: v.X * invMag, Y: v.Y * invMag}
-}
-
-func (v Vector2D) Distance(other Vector2D) float64 {
-	return v.Sub(other).Magnitude()
+func (v Vector2D) Magnitude() float64 {
+	return math.Sqrt(v.MagnitudeSquared())
 }
 
 func (v Vector2D) DistanceSquared(other Vector2D) float64 {
-	return v.Sub(other).MagnitudeSquared()
+	dx := v.X - other.X
+	dy := v.Y - other.Y
+	return dx*dx + dy*dy
+}
+
+func (v Vector2D) Distance(other Vector2D) float64 {
+	return math.Sqrt(v.DistanceSquared(other))
 }
 
 func fastInvSqrt(x float32) float32 {
 	const threeHalfs = 1.5
 	x2 := x * 0.5
 	y := x
-	i := *(*int32)(unsafe.Pointer(&y))
+	i := math.Float32bits(y)
 	i = 0x5f3759df - (i >> 1)
-	y = *(*float32)(unsafe.Pointer(&i))
+	y = math.Float32frombits(i)
 	y = y * (threeHalfs - (x2 * y * y))
 	return y
 }
-
-// ==================== COLLISION TYPES ====================
 
 type CollisionManifold struct {
 	BodyA, BodyB     *RigidBody
@@ -144,8 +140,6 @@ func (aabb AABB) Expand(margin float64) AABB {
 		Max: Vector2D{X: aabb.Max.X + margin, Y: aabb.Max.Y + margin},
 	}
 }
-
-// ==================== SHAPE INTERFACE ====================
 
 type Shape interface {
 	GetAABB(position Vector2D) AABB
@@ -218,8 +212,6 @@ func (b *BoxShape) GetType() ShapeType {
 	return ShapeTypeBox
 }
 
-// ==================== OBJECT POOLING SYSTEM ====================
-
 type ObjectPool struct {
 	manifoldPool sync.Pool
 	vector2DPool sync.Pool
@@ -259,8 +251,6 @@ func (op *ObjectPool) GetManifold() *CollisionManifold {
 func (op *ObjectPool) PutManifold(manifold *CollisionManifold) {
 	op.manifoldPool.Put(manifold)
 }
-
-// ==================== ENHANCED RIGID BODY ====================
 
 const (
 	SleepLinearTolerance  = 0.01
@@ -458,8 +448,6 @@ func (rb *RigidBody) Integrate(dt float64, gravity Vector2D) {
 	rb.torque = 0
 }
 
-// ==================== SPATIAL GRID ====================
-
 type GridCell struct {
 	X, Y int
 }
@@ -550,10 +538,14 @@ func (sg *SpatialGrid) getCell(pos Vector2D) GridCell {
 	}
 }
 
-// ==================== COLLISION DETECTION ====================
+var collisionPairsPool = sync.Pool{
+	New: func() interface{} {
+		return make([][2]*RigidBody, 0, 256)
+	},
+}
 
 func DetectCollision(bodyA, bodyB *RigidBody, pool *ObjectPool) *CollisionManifold {
-	if !bodyA.IsAwake() && !bodyB.IsAwake() {
+	if (bodyA.isStatic && bodyB.isStatic) || (bodyA.IsSleeping() && bodyB.IsSleeping()) {
 		return nil
 	}
 
@@ -727,8 +719,6 @@ func detectCircleBox(circleBody, boxBody *RigidBody, circle *CircleShape, box *B
 	return manifold
 }
 
-// ==================== COLLISION RESOLUTION ====================
-
 func ResolveCollision(manifold *CollisionManifold) {
 	bodyA := manifold.BodyA
 	bodyB := manifold.BodyB
@@ -828,11 +818,15 @@ func correctPositions(manifold *CollisionManifold) {
 	bodyA.mu.Unlock()
 }
 
-// ==================== WORKER POOL ====================
-
 type Task struct {
 	Execute func() error
 	ID      int
+}
+
+var taskPool = sync.Pool{
+	New: func() interface{} {
+		return &Task{}
+	},
 }
 
 type WorkerPool struct {
@@ -907,8 +901,6 @@ func (wp *WorkerPool) Close() {
 		wp.wg.Wait()
 	})
 }
-
-// ==================== PHYSICS WORLD ====================
 
 type PhysicsWorld struct {
 	bodies      []*RigidBody
@@ -1080,6 +1072,12 @@ func (pw *PhysicsWorld) processCollisions() error {
 	batchSize := max(1, len(pairs)/(pw.maxWorkers*4))
 	var wg sync.WaitGroup
 
+	manifoldsPool := sync.Pool{
+		New: func() interface{} {
+			return make([]*CollisionManifold, 0, batchSize)
+		},
+	}
+
 	for i := 0; i < len(pairs); i += batchSize {
 		end := min(i+batchSize, len(pairs))
 		batch := pairs[i:end]
@@ -1087,33 +1085,27 @@ func (pw *PhysicsWorld) processCollisions() error {
 		wg.Add(1)
 		go func(batch [][2]*RigidBody) {
 			defer wg.Done()
-			pw.processBatchCollisions(batch)
+			manifolds := manifoldsPool.Get().([]*CollisionManifold)[:0]
+			for _, pair := range batch {
+				manifold := DetectCollision(pair[0], pair[1], pw.objectPool)
+				if manifold != nil {
+					manifolds = append(manifolds, manifold)
+				}
+			}
+			for iter := 0; iter < pw.iterations; iter++ {
+				for _, manifold := range manifolds {
+					ResolveCollision(manifold)
+				}
+			}
+			for _, manifold := range manifolds {
+				pw.objectPool.PutManifold(manifold)
+			}
+			manifoldsPool.Put(manifolds)
 		}(batch)
 	}
 
 	wg.Wait()
 	return nil
-}
-
-func (pw *PhysicsWorld) processBatchCollisions(batch [][2]*RigidBody) {
-	manifolds := make([]*CollisionManifold, 0, len(batch))
-
-	for _, pair := range batch {
-		manifold := DetectCollision(pair[0], pair[1], pw.objectPool)
-		if manifold != nil {
-			manifolds = append(manifolds, manifold)
-		}
-	}
-
-	for iter := 0; iter < pw.iterations; iter++ {
-		for _, manifold := range manifolds {
-			ResolveCollision(manifold)
-		}
-	}
-
-	for _, manifold := range manifolds {
-		pw.objectPool.PutManifold(manifold)
-	}
 }
 
 func (pw *PhysicsWorld) updateSleepStates(bodies []*RigidBody, dt float64) {
@@ -1155,8 +1147,6 @@ func (pw *PhysicsWorld) GetSleepingBodiesCount() int64 {
 func (pw *PhysicsWorld) Close() {
 	pw.workerPool.Close()
 }
-
-// ==================== PHYSICS ENGINE ====================
 
 type PhysicsEngine struct {
 	world     *PhysicsWorld
@@ -1276,8 +1266,6 @@ func (pe *PhysicsEngine) GetAdvancedStats() (fps, avgFrameTime, minFrameTime, ma
 		workerTotal
 }
 
-// ==================== SCENE CONFIGURATION ====================
-
 type SceneConfig struct {
 	Bodies   []BodyConfig `json:"bodies"`
 	Gravity  Vector2D     `json:"gravity"`
@@ -1337,8 +1325,6 @@ func (pe *PhysicsEngine) LoadScene(config *SceneConfig) error {
 	return nil
 }
 
-// ==================== HELPER FUNCTIONS ====================
-
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -1353,76 +1339,54 @@ func max(a, b int) int {
 	return b
 }
 
-// ==================== CLI CONFIGURATION ====================
-
 type Config struct {
-	// Simulation parameters
-	GravityX float64
-	GravityY float64
-	TimeStep float64
-	Duration float64
-	MaxFPS   int
-
-	// Performance settings
-	Workers      int
-	Iterations   int
-	SleepEnabled bool
-
-	// Output settings
+	GravityX      float64
+	GravityY      float64
+	TimeStep      float64
+	Duration      float64
+	MaxFPS        int
+	Workers       int
+	Iterations    int
+	SleepEnabled  bool
 	Verbose       bool
 	Quiet         bool
 	StatsInterval float64
 	ProfileCPU    string
 	ProfileMem    string
-
-	// Scene settings
-	SceneFile   string
-	BodiesCount int
-	SceneType   string
-
-	// Engine settings
-	Damping     float64
-	Restitution float64
-	Friction    float64
+	SceneFile     string
+	BodiesCount   int
+	SceneType     string
+	Damping       float64
+	Restitution   float64
+	Friction      float64
 }
 
 func parseFlags() *Config {
 	config := &Config{}
 
-	// Simulation parameters
 	flag.Float64Var(&config.GravityX, "gravity-x", 0.0, "gravity X component")
 	flag.Float64Var(&config.GravityY, "gravity-y", -9.81, "gravity Y component")
 	flag.Float64Var(&config.TimeStep, "timestep", 1.0/60.0, "physics time step")
 	flag.Float64Var(&config.Duration, "duration", 0, "simulation duration in seconds (0 = infinite)")
 	flag.IntVar(&config.MaxFPS, "fps", 60, "maximum frames per second")
-
-	// Performance settings
 	flag.IntVar(&config.Workers, "workers", runtime.NumCPU(), "number of worker threads")
 	flag.IntVar(&config.Iterations, "iterations", 6, "collision resolution iterations")
 	flag.BoolVar(&config.SleepEnabled, "sleep", true, "enable body sleeping")
-
-	// Output settings
 	flag.BoolVar(&config.Verbose, "verbose", false, "verbose output")
 	flag.BoolVar(&config.Quiet, "quiet", false, "minimal output")
 	flag.Float64Var(&config.StatsInterval, "stats-interval", 2.0, "statistics reporting interval")
 	flag.StringVar(&config.ProfileCPU, "profile-cpu", "", "CPU profile output file")
 	flag.StringVar(&config.ProfileMem, "profile-mem", "", "memory profile output file")
-
-	// Scene settings
 	flag.StringVar(&config.SceneFile, "scene", "", "JSON scene file to load")
 	flag.IntVar(&config.BodiesCount, "bodies", 100, "number of bodies for generated scenes")
 	flag.StringVar(&config.SceneType, "scene-type", "default", "scene type (default, pyramid, rain, container)")
-
-	// Engine settings
 	flag.Float64Var(&config.Damping, "damping", 0.999, "global damping factor")
 	flag.Float64Var(&config.Restitution, "restitution", 0.8, "default restitution")
 	flag.Float64Var(&config.Friction, "friction", 0.3, "default friction")
 
-	// Version flag
 	var showVersion bool
 	flag.BoolVar(&showVersion, "version", false, "show version information")
 
-	// Custom usage
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Physics2D - High-Performance 2D Physics Engine\n\n")
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS]\n\n", os.Args[0])
@@ -1444,7 +1408,6 @@ func parseFlags() *Config {
 		os.Exit(0)
 	}
 
-	// Validate configuration
 	if err := validateConfig(config); err != nil {
 		log.Fatalf("Invalid configuration: %v", err)
 	}
@@ -1480,8 +1443,6 @@ func validateConfig(config *Config) error {
 	return nil
 }
 
-// ==================== SCENE GENERATORS ====================
-
 func generateScene(engine *PhysicsEngine, config *Config) {
 	switch config.SceneType {
 	case "pyramid":
@@ -1500,10 +1461,8 @@ func generateScene(engine *PhysicsEngine, config *Config) {
 }
 
 func generateDefaultScene(engine *PhysicsEngine, bodyCount int) {
-	// Ground
 	engine.AddBox(0, NewVector2D(0, -50), 200, 10)
 
-	// Dynamic objects
 	for i := 0; i < bodyCount; i++ {
 		x := (rand.Float64() - 0.5) * 150
 		y := rand.Float64()*50 + 50
@@ -1537,12 +1496,10 @@ func generatePyramidScene(engine *PhysicsEngine, bodyCount int) {
 }
 
 func generateRainScene(engine *PhysicsEngine, bodyCount int) {
-	// Boundaries
 	engine.AddBox(0, NewVector2D(0, -50), 300, 10)
 	engine.AddBox(0, NewVector2D(-150, 0), 10, 100)
 	engine.AddBox(0, NewVector2D(150, 0), 10, 100)
 
-	// Falling objects
 	for i := 0; i < bodyCount; i++ {
 		x := (rand.Float64() - 0.5) * 250
 		y := rand.Float64()*200 + 100
@@ -1565,12 +1522,10 @@ func generateContainerScene(engine *PhysicsEngine, bodyCount int) {
 	containerWidth := 100.0
 	containerHeight := 80.0
 
-	// Container walls
 	engine.AddBox(0, NewVector2D(0, -containerHeight/2), containerWidth, wallThickness)
 	engine.AddBox(0, NewVector2D(-containerWidth/2, 0), wallThickness, containerHeight)
 	engine.AddBox(0, NewVector2D(containerWidth/2, 0), wallThickness, containerHeight)
 
-	// Fill container
 	for i := 0; i < bodyCount; i++ {
 		x := (rand.Float64() - 0.5) * (containerWidth - 20)
 		y := rand.Float64()*60 + 10
@@ -1591,10 +1546,8 @@ func generatePendulumScene(engine *PhysicsEngine, bodyCount int) {
 	for i := 0; i < bodyCount/3; i++ {
 		x := float64(i-bodyCount/6) * 10
 
-		// Anchor
 		engine.AddCircle(0, NewVector2D(x, 50), 0.5)
 
-		// Bob
 		bobY := 30.0
 		bobMass := 2.0
 		bob := engine.AddCircle(bobMass, NewVector2D(x, bobY), 1.5)
@@ -1603,7 +1556,6 @@ func generatePendulumScene(engine *PhysicsEngine, bodyCount int) {
 }
 
 func generateMixedScene(engine *PhysicsEngine, bodyCount int) {
-	// Complex environment with platforms
 	engine.AddBox(0, NewVector2D(-75, -50), 50, 10)
 	engine.AddBox(0, NewVector2D(75, -50), 50, 10)
 
@@ -1614,7 +1566,6 @@ func generateMixedScene(engine *PhysicsEngine, bodyCount int) {
 		engine.AddBox(0, NewVector2D(x, y), width, 3)
 	}
 
-	// Mixed dynamic objects
 	for i := 0; i < bodyCount; i++ {
 		x := (rand.Float64() - 0.5) * 200
 		y := rand.Float64()*100 + 50
@@ -1643,20 +1594,15 @@ func generateMixedScene(engine *PhysicsEngine, bodyCount int) {
 	}
 }
 
-// ==================== MAIN APPLICATION ====================
-
 func main() {
-	// Parse command line flags
 	config := parseFlags()
 
-	// Set up logging
 	if config.Quiet {
 		log.SetOutput(io.Discard)
 	} else if config.Verbose {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
 
-	// Set up profiling
 	if config.ProfileCPU != "" {
 		f, err := os.Create(config.ProfileCPU)
 		if err != nil {
@@ -1670,7 +1616,6 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	// Optimize for performance
 	runtime.GOMAXPROCS(config.Workers)
 	rand.Seed(time.Now().UnixNano())
 
@@ -1679,17 +1624,14 @@ func main() {
 		log.Printf("CPU Cores: %d, Workers: %d", runtime.NumCPU(), config.Workers)
 	}
 
-	// Create physics engine
 	engine := NewPhysicsEngine()
 	engine.targetFPS = config.MaxFPS
 	engine.world.maxWorkers = config.Workers
 	engine.world.iterations = config.Iterations
 	engine.world.sleepingEnabled = config.SleepEnabled
 
-	// Set gravity
 	engine.SetGravity(NewVector2D(config.GravityX, config.GravityY))
 
-	// Load or generate scene
 	if config.SceneFile != "" {
 		sceneConfig, err := LoadSceneFromFile(config.SceneFile)
 		if err != nil {
@@ -1714,26 +1656,21 @@ func main() {
 		}
 	}
 
-	// Create context for simulation control
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Set up duration limit
 	if config.Duration > 0 {
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(config.Duration*float64(time.Second)))
 		defer cancel()
 	}
 
-	// Handle interrupt signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start statistics reporting
 	if !config.Quiet {
 		go reportStats(ctx, engine, config.StatsInterval, config.Verbose)
 	}
 
-	// Handle shutdown
 	go func() {
 		select {
 		case <-sigChan:
@@ -1742,11 +1679,9 @@ func main() {
 			}
 			cancel()
 		case <-ctx.Done():
-			// Context finished naturally
 		}
 	}()
 
-	// Run the physics simulation
 	if !config.Quiet {
 		log.Printf("Physics simulation started (FPS: %d, Workers: %d)", config.MaxFPS, config.Workers)
 		if config.Duration > 0 {
@@ -1760,7 +1695,6 @@ func main() {
 		log.Fatalf("Engine error: %v", err)
 	}
 
-	// Memory profiling
 	if config.ProfileMem != "" {
 		f, err := os.Create(config.ProfileMem)
 		if err != nil {
@@ -1775,7 +1709,6 @@ func main() {
 	}
 
 	if !config.Quiet {
-		// Final statistics
 		fps, bodies, steps, frames := engine.GetStats()
 		log.Printf("Simulation completed:")
 		log.Printf("  Final FPS: %.1f", fps)
@@ -1813,4 +1746,14 @@ func reportStats(ctx context.Context, engine *PhysicsEngine, interval float64, v
 			return
 		}
 	}
+}
+
+func BenchmarkPhysicsEngine(engine *PhysicsEngine, steps int) (avgStepTime float64) {
+	start := time.Now()
+	ctx := context.Background()
+	for i := 0; i < steps; i++ {
+		engine.world.Step(ctx, 1.0/float64(engine.targetFPS))
+	}
+	dur := time.Since(start).Seconds()
+	return dur / float64(steps)
 }
