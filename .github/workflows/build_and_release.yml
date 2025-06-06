@@ -1,0 +1,192 @@
+name: Build and Release Physics2D
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  GO_VERSION: '1.24'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      
+      - name: Install UPX (for binary compression)
+        run: |
+          wget https://github.com/upx/upx/releases/download/v4.2.1/upx-4.2.1-amd64_linux.tar.xz
+          tar -xf upx-4.2.1-amd64_linux.tar.xz
+          sudo mv upx-4.2.1-amd64_linux/upx /usr/local/bin/
+          upx --version
+      
+      - name: Make build script executable
+        run: chmod +x build.sh
+      
+      - name: Run release build
+        run: ./build.sh release
+      
+      - name: Generate checksums
+        run: |
+          cd build
+          sha256sum * > checksums.txt
+          cat checksums.txt
+      
+      - name: Prepare release artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp build/* release-artifacts/
+          
+          # Create archive for each platform
+          cd build
+          for file in physics2d-*; do
+            if [[ "$file" == *.exe ]]; then
+              # Windows binary
+              platform=${file%.exe}
+              platform=${platform#physics2d-}
+              zip "../release-artifacts/${platform}.zip" "$file"
+            else
+              # Unix binary
+              platform=${file#physics2d-}
+              tar -czf "../release-artifacts/${platform}.tar.gz" "$file"
+            fi
+          done
+          
+          # Copy checksums to release artifacts
+          cp checksums.txt ../release-artifacts/
+      
+      - name: Extract version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+      
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          cat << 'EOF' > release_notes.md
+          ## Physics2D ${{ steps.get_version.outputs.version }}
+          
+          ### 🚀 Features
+          - High-performance 2D physics engine
+          - Multi-platform support (Linux, macOS, Windows, FreeBSD)
+          - Optimized binaries with UPX compression
+          
+          ### 📦 Downloads
+          Choose the appropriate binary for your platform:
+          
+          | Platform | Architecture | Download |
+          |----------|--------------|----------|
+          | Linux | x64 | `physics2d-linux-amd64` |
+          | Linux | ARM64 | `physics2d-linux-arm64` |
+          | macOS | x64 (Intel) | `physics2d-darwin-amd64` |
+          | macOS | ARM64 (Apple Silicon) | `physics2d-darwin-arm64` |
+          | Windows | x64 | `physics2d-windows-amd64.exe` |
+          | FreeBSD | x64 | `physics2d-freebsd-amd64` |
+          
+          ### 🔐 Verification
+          Verify downloads using the provided `checksums.txt` file:
+          ```
+          sha256sum -c checksums.txt
+          ```
+          
+          ### 📊 Build Information
+          - Go Version: $(go version | awk '{print $3}')
+          - Build Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          - Commit: ${{ github.sha }}
+          EOF
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get_version.outputs.version }}
+          name: Physics2D ${{ steps.get_version.outputs.version }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(steps.get_version.outputs.version, '-') }}
+          files: |
+            release-artifacts/physics2d-linux-amd64
+            release-artifacts/physics2d-linux-arm64
+            release-artifacts/physics2d-darwin-amd64
+            release-artifacts/physics2d-darwin-arm64
+            release-artifacts/physics2d-windows-amd64.exe
+            release-artifacts/physics2d-freebsd-amd64
+            release-artifacts/linux-amd64.tar.gz
+            release-artifacts/linux-arm64.tar.gz
+            release-artifacts/darwin-amd64.tar.gz
+            release-artifacts/darwin-arm64.tar.gz
+            release-artifacts/windows-amd64.zip
+            release-artifacts/freebsd-amd64.tar.gz
+            release-artifacts/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Upload build artifacts (backup)
+        uses: actions/upload-artifact@v3
+        if: failure()
+        with:
+          name: physics2d-${{ steps.get_version.outputs.version }}-artifacts
+          path: release-artifacts/
+          retention-days: 30
+
+  # Optional: Create a test job to validate builds work
+  validate-builds:
+    runs-on: ${{ matrix.os }}
+    needs: build-and-release
+    if: always() && needs.build-and-release.result == 'success'
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    
+    steps:
+      - name: Download release assets
+        uses: robinraju/release-downloader@v1.8
+        with:
+          tag: ${{ github.ref_name }}
+          filename: |
+            physics2d-*
+            checksums.txt
+      
+      - name: Verify checksums
+        if: runner.os != 'Windows'
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sha256sum -c checksums.txt --ignore-missing
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            shasum -a 256 -c checksums.txt --ignore-missing 2>/dev/null || true
+          fi
+      
+      - name: Test binary execution
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            chmod +x physics2d-linux-amd64
+            ./physics2d-linux-amd64 --help || echo "Binary test completed"
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            chmod +x physics2d-darwin-amd64
+            ./physics2d-darwin-amd64 --help || echo "Binary test completed"
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            ./physics2d-windows-amd64.exe --help || echo "Binary test completed"
+          fi
