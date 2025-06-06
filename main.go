@@ -81,6 +81,19 @@ func (v Vector2D) Distance(other Vector2D) float64 {
 	return math.Sqrt(v.DistanceSquared(other))
 }
 
+func (v Vector2D) Rotate(angle float64) Vector2D {
+	cos := math.Cos(angle)
+	sin := math.Sin(angle)
+	return Vector2D{
+		X: v.X*cos - v.Y*sin,
+		Y: v.X*sin + v.Y*cos,
+	}
+}
+
+func (v Vector2D) Perp() Vector2D {
+	return Vector2D{X: -v.Y, Y: v.X}
+}
+
 func fastInvSqrt(x float32) float32 {
 	const threeHalfs = 1.5
 	x2 := x * 0.5
@@ -142,10 +155,12 @@ func (aabb AABB) Expand(margin float64) AABB {
 }
 
 type Shape interface {
-	GetAABB(position Vector2D) AABB
+	GetAABB(position Vector2D, angle float64) AABB
 	GetMomentOfInertia(mass float64) float64
-	TestPoint(position, point Vector2D) bool
+	TestPoint(position Vector2D, angle float64, point Vector2D) bool
 	GetType() ShapeType
+	GetVertices(position Vector2D, angle float64) []Vector2D
+	GetNormals() []Vector2D
 }
 
 type ShapeType int
@@ -164,7 +179,7 @@ func NewCircleShape(radius float64) *CircleShape {
 	return &CircleShape{Radius: radius}
 }
 
-func (c *CircleShape) GetAABB(position Vector2D) AABB {
+func (c *CircleShape) GetAABB(position Vector2D, angle float64) AABB {
 	return AABB{
 		Min: Vector2D{X: position.X - c.Radius, Y: position.Y - c.Radius},
 		Max: Vector2D{X: position.X + c.Radius, Y: position.Y + c.Radius},
@@ -175,7 +190,7 @@ func (c *CircleShape) GetMomentOfInertia(mass float64) float64 {
 	return 0.5 * mass * c.Radius * c.Radius
 }
 
-func (c *CircleShape) TestPoint(position, point Vector2D) bool {
+func (c *CircleShape) TestPoint(position Vector2D, angle float64, point Vector2D) bool {
 	return position.DistanceSquared(point) <= c.Radius*c.Radius
 }
 
@@ -183,33 +198,232 @@ func (c *CircleShape) GetType() ShapeType {
 	return ShapeTypeCircle
 }
 
+func (c *CircleShape) GetVertices(position Vector2D, angle float64) []Vector2D {
+	return []Vector2D{position}
+}
+
+func (c *CircleShape) GetNormals() []Vector2D {
+	return []Vector2D{}
+}
+
 type BoxShape struct {
 	Width, Height float64
+	vertices      []Vector2D
+	normals       []Vector2D
 }
 
 func NewBoxShape(width, height float64) *BoxShape {
-	return &BoxShape{Width: width, Height: height}
+	halfW, halfH := width*0.5, height*0.5
+	vertices := []Vector2D{
+		{X: -halfW, Y: -halfH},
+		{X: halfW, Y: -halfH},
+		{X: halfW, Y: halfH},
+		{X: -halfW, Y: halfH},
+	}
+	normals := []Vector2D{
+		{X: 0, Y: -1},
+		{X: 1, Y: 0},
+		{X: 0, Y: 1},
+		{X: -1, Y: 0},
+	}
+	return &BoxShape{
+		Width:    width,
+		Height:   height,
+		vertices: vertices,
+		normals:  normals,
+	}
 }
 
-func (b *BoxShape) GetAABB(position Vector2D) AABB {
-	halfW, halfH := b.Width*0.5, b.Height*0.5
-	return AABB{
-		Min: Vector2D{X: position.X - halfW, Y: position.Y - halfH},
-		Max: Vector2D{X: position.X + halfW, Y: position.Y + halfH},
+func (b *BoxShape) GetAABB(position Vector2D, angle float64) AABB {
+	vertices := b.GetVertices(position, angle)
+	minX, maxX := vertices[0].X, vertices[0].X
+	minY, maxY := vertices[0].Y, vertices[0].Y
+
+	for _, v := range vertices[1:] {
+		if v.X < minX {
+			minX = v.X
+		}
+		if v.X > maxX {
+			maxX = v.X
+		}
+		if v.Y < minY {
+			minY = v.Y
+		}
+		if v.Y > maxY {
+			maxY = v.Y
+		}
 	}
+
+	return AABB{Min: Vector2D{X: minX, Y: minY}, Max: Vector2D{X: maxX, Y: maxY}}
 }
 
 func (b *BoxShape) GetMomentOfInertia(mass float64) float64 {
 	return mass * (b.Width*b.Width + b.Height*b.Height) / 12.0
 }
 
-func (b *BoxShape) TestPoint(position, point Vector2D) bool {
-	aabb := b.GetAABB(position)
-	return aabb.Contains(point)
+func (b *BoxShape) TestPoint(position Vector2D, angle float64, point Vector2D) bool {
+	vertices := b.GetVertices(position, angle)
+	return isPointInPolygon(point, vertices)
 }
 
 func (b *BoxShape) GetType() ShapeType {
 	return ShapeTypeBox
+}
+
+func (b *BoxShape) GetVertices(position Vector2D, angle float64) []Vector2D {
+	vertices := make([]Vector2D, len(b.vertices))
+	for i, v := range b.vertices {
+		rotated := v.Rotate(angle)
+		vertices[i] = position.Add(rotated)
+	}
+	return vertices
+}
+
+func (b *BoxShape) GetNormals() []Vector2D {
+	return b.normals
+}
+
+type PolygonShape struct {
+	vertices []Vector2D
+	normals  []Vector2D
+	centroid Vector2D
+}
+
+func NewPolygonShape(vertices []Vector2D) *PolygonShape {
+	if len(vertices) < 3 {
+		panic("polygon must have at least 3 vertices")
+	}
+
+	normalizedVertices := make([]Vector2D, len(vertices))
+	centroid := calculateCentroid(vertices)
+
+	for i, v := range vertices {
+		normalizedVertices[i] = v.Sub(centroid)
+	}
+
+	normals := calculateNormals(normalizedVertices)
+
+	return &PolygonShape{
+		vertices: normalizedVertices,
+		normals:  normals,
+		centroid: centroid,
+	}
+}
+
+func calculateCentroid(vertices []Vector2D) Vector2D {
+	var centroid Vector2D
+	area := 0.0
+
+	for i := 0; i < len(vertices); i++ {
+		j := (i + 1) % len(vertices)
+		cross := vertices[i].Cross(vertices[j])
+		area += cross
+		centroid = centroid.Add(vertices[i].Add(vertices[j]).Scale(cross))
+	}
+
+	area *= 0.5
+	if math.Abs(area) < 1e-10 {
+		sum := Vector2D{}
+		for _, v := range vertices {
+			sum = sum.Add(v)
+		}
+		return sum.Scale(1.0 / float64(len(vertices)))
+	}
+
+	return centroid.Scale(1.0 / (6.0 * area))
+}
+
+func calculateNormals(vertices []Vector2D) []Vector2D {
+	normals := make([]Vector2D, len(vertices))
+	for i := 0; i < len(vertices); i++ {
+		j := (i + 1) % len(vertices)
+		edge := vertices[j].Sub(vertices[i])
+		normals[i] = edge.Perp().Normalize()
+	}
+	return normals
+}
+
+func (p *PolygonShape) GetAABB(position Vector2D, angle float64) AABB {
+	vertices := p.GetVertices(position, angle)
+	minX, maxX := vertices[0].X, vertices[0].X
+	minY, maxY := vertices[0].Y, vertices[0].Y
+
+	for _, v := range vertices[1:] {
+		if v.X < minX {
+			minX = v.X
+		}
+		if v.X > maxX {
+			maxX = v.X
+		}
+		if v.Y < minY {
+			minY = v.Y
+		}
+		if v.Y > maxY {
+			maxY = v.Y
+		}
+	}
+
+	return AABB{Min: Vector2D{X: minX, Y: minY}, Max: Vector2D{X: maxX, Y: maxY}}
+}
+
+func (p *PolygonShape) GetMomentOfInertia(mass float64) float64 {
+	numerator := 0.0
+	denominator := 0.0
+
+	for i := 0; i < len(p.vertices); i++ {
+		j := (i + 1) % len(p.vertices)
+		v1, v2 := p.vertices[i], p.vertices[j]
+
+		cross := math.Abs(v1.Cross(v2))
+		numerator += cross * (v1.Dot(v1) + v1.Dot(v2) + v2.Dot(v2))
+		denominator += cross
+	}
+
+	if denominator == 0 {
+		return 0
+	}
+
+	return mass * numerator / (6.0 * denominator)
+}
+
+func (p *PolygonShape) TestPoint(position Vector2D, angle float64, point Vector2D) bool {
+	vertices := p.GetVertices(position, angle)
+	return isPointInPolygon(point, vertices)
+}
+
+func (p *PolygonShape) GetType() ShapeType {
+	return ShapeTypePolygon
+}
+
+func (p *PolygonShape) GetVertices(position Vector2D, angle float64) []Vector2D {
+	vertices := make([]Vector2D, len(p.vertices))
+	for i, v := range p.vertices {
+		rotated := v.Rotate(angle)
+		vertices[i] = position.Add(rotated)
+	}
+	return vertices
+}
+
+func (p *PolygonShape) GetNormals() []Vector2D {
+	return p.normals
+}
+
+func isPointInPolygon(point Vector2D, vertices []Vector2D) bool {
+	inside := false
+	j := len(vertices) - 1
+
+	for i := 0; i < len(vertices); i++ {
+		xi, yi := vertices[i].X, vertices[i].Y
+		xj, yj := vertices[j].X, vertices[j].Y
+
+		if ((yi > point.Y) != (yj > point.Y)) &&
+			(point.X < (xj-xi)*(point.Y-yi)/(yj-yi)+xi) {
+			inside = !inside
+		}
+		j = i
+	}
+
+	return inside
 }
 
 type ObjectPool struct {
@@ -364,9 +578,16 @@ func (rb *RigidBody) GetVelocity() Vector2D {
 	return vel
 }
 
+func (rb *RigidBody) GetAngle() float64 {
+	rb.mu.RLock()
+	angle := rb.angle
+	rb.mu.RUnlock()
+	return angle
+}
+
 func (rb *RigidBody) GetAABB() AABB {
 	rb.mu.RLock()
-	aabb := rb.shape.GetAABB(rb.position)
+	aabb := rb.shape.GetAABB(rb.position, rb.angle)
 	rb.mu.RUnlock()
 	return aabb
 }
@@ -562,11 +783,26 @@ func DetectCollision(bodyA, bodyB *RigidBody, pool *ObjectPool) *CollisionManifo
 	case shapeTypeA == ShapeTypeCircle && shapeTypeB == ShapeTypeCircle:
 		return detectCircleCircle(bodyA, bodyB, bodyA.shape.(*CircleShape), bodyB.shape.(*CircleShape), pool)
 	case shapeTypeA == ShapeTypeBox && shapeTypeB == ShapeTypeBox:
-		return detectBoxBox(bodyA, bodyB, bodyA.shape.(*BoxShape), bodyB.shape.(*BoxShape), pool)
+		return detectPolygonPolygon(bodyA, bodyB, pool)
+	case shapeTypeA == ShapeTypePolygon && shapeTypeB == ShapeTypePolygon:
+		return detectPolygonPolygon(bodyA, bodyB, pool)
+	case shapeTypeA == ShapeTypeBox && shapeTypeB == ShapeTypePolygon:
+		return detectPolygonPolygon(bodyA, bodyB, pool)
+	case shapeTypeA == ShapeTypePolygon && shapeTypeB == ShapeTypeBox:
+		return detectPolygonPolygon(bodyA, bodyB, pool)
 	case shapeTypeA == ShapeTypeCircle && shapeTypeB == ShapeTypeBox:
-		return detectCircleBox(bodyA, bodyB, bodyA.shape.(*CircleShape), bodyB.shape.(*BoxShape), pool)
+		return detectCirclePolygon(bodyA, bodyB, pool)
 	case shapeTypeA == ShapeTypeBox && shapeTypeB == ShapeTypeCircle:
-		manifold := detectCircleBox(bodyB, bodyA, bodyB.shape.(*CircleShape), bodyA.shape.(*BoxShape), pool)
+		manifold := detectCirclePolygon(bodyB, bodyA, pool)
+		if manifold != nil {
+			manifold.BodyA, manifold.BodyB = manifold.BodyB, manifold.BodyA
+			manifold.Normal = manifold.Normal.Scale(-1)
+		}
+		return manifold
+	case shapeTypeA == ShapeTypeCircle && shapeTypeB == ShapeTypePolygon:
+		return detectCirclePolygon(bodyA, bodyB, pool)
+	case shapeTypeA == ShapeTypePolygon && shapeTypeB == ShapeTypeCircle:
+		manifold := detectCirclePolygon(bodyB, bodyA, pool)
 		if manifold != nil {
 			manifold.BodyA, manifold.BodyB = manifold.BodyB, manifold.BodyA
 			manifold.Normal = manifold.Normal.Scale(-1)
@@ -615,108 +851,169 @@ func detectCircleCircle(bodyA, bodyB *RigidBody, circleA, circleB *CircleShape, 
 	return manifold
 }
 
-func detectBoxBox(bodyA, bodyB *RigidBody, boxA, boxB *BoxShape, pool *ObjectPool) *CollisionManifold {
-	aabbA := bodyA.GetAABB()
-	aabbB := bodyB.GetAABB()
+func detectPolygonPolygon(bodyA, bodyB *RigidBody, pool *ObjectPool) *CollisionManifold {
+	verticesA := bodyA.shape.GetVertices(bodyA.GetPosition(), bodyA.GetAngle())
+	verticesB := bodyB.shape.GetVertices(bodyB.GetPosition(), bodyB.GetAngle())
 
-	overlapX := math.Min(aabbA.Max.X, aabbB.Max.X) - math.Max(aabbA.Min.X, aabbB.Min.X)
-	overlapY := math.Min(aabbA.Max.Y, aabbB.Max.Y) - math.Max(aabbA.Min.Y, aabbB.Min.Y)
+	var minPenetration float64 = math.MaxFloat64
+	var separationNormal Vector2D
+	var contactPoints []Vector2D
 
-	if overlapX <= 0 || overlapY <= 0 {
+	if !checkSeparation(verticesA, verticesB, &minPenetration, &separationNormal) {
 		return nil
 	}
 
-	var normal Vector2D
-	var penetration float64
-
-	if overlapX < overlapY {
-		penetration = overlapX
-		if aabbA.Min.X < aabbB.Min.X {
-			normal = Vector2D{X: -1, Y: 0}
-		} else {
-			normal = Vector2D{X: 1, Y: 0}
-		}
-	} else {
-		penetration = overlapY
-		if aabbA.Min.Y < aabbB.Min.Y {
-			normal = Vector2D{X: 0, Y: -1}
-		} else {
-			normal = Vector2D{X: 0, Y: 1}
-		}
+	if !checkSeparation(verticesB, verticesA, &minPenetration, &separationNormal) {
+		return nil
 	}
 
-	posA := bodyA.GetPosition()
-	posB := bodyB.GetPosition()
-	contactPoint := posA.Add(posB).Scale(0.5)
+	contactPoints = findContactPoints(verticesA, verticesB, separationNormal)
+
+	if len(contactPoints) == 0 {
+		return nil
+	}
 
 	manifold := pool.GetManifold()
 	manifold.BodyA = bodyA
 	manifold.BodyB = bodyB
-	manifold.Normal = normal
-	manifold.Penetration = penetration
-	manifold.ContactPoints = append(manifold.ContactPoints, contactPoint)
+	manifold.Normal = separationNormal
+	manifold.Penetration = minPenetration
+	manifold.ContactPoints = contactPoints
 	manifold.Restitution = math.Min(bodyA.restitution, bodyB.restitution)
 	manifold.Friction = math.Sqrt(bodyA.friction * bodyB.friction)
 
 	return manifold
 }
 
-func detectCircleBox(circleBody, boxBody *RigidBody, circle *CircleShape, box *BoxShape, pool *ObjectPool) *CollisionManifold {
-	circlePos := circleBody.GetPosition()
-	boxPos := boxBody.GetPosition()
+func checkSeparation(verticesA, verticesB []Vector2D, minPenetration *float64, separationNormal *Vector2D) bool {
+	for i := 0; i < len(verticesA); i++ {
+		j := (i + 1) % len(verticesA)
+		edge := verticesA[j].Sub(verticesA[i])
+		normal := edge.Perp().Normalize()
 
-	halfW, halfH := box.Width*0.5, box.Height*0.5
-	closest := Vector2D{
-		X: math.Max(boxPos.X-halfW, math.Min(circlePos.X, boxPos.X+halfW)),
-		Y: math.Max(boxPos.Y-halfH, math.Min(circlePos.Y, boxPos.Y+halfH)),
+		minA, maxA := projectVertices(verticesA, normal)
+		minB, maxB := projectVertices(verticesB, normal)
+
+		if maxA <= minB || maxB <= minA {
+			return false
+		}
+
+		penetration := math.Min(maxA-minB, maxB-minA)
+		if penetration < *minPenetration {
+			*minPenetration = penetration
+			*separationNormal = normal
+		}
+	}
+	return true
+}
+
+func projectVertices(vertices []Vector2D, axis Vector2D) (float64, float64) {
+	min := vertices[0].Dot(axis)
+	max := min
+
+	for i := 1; i < len(vertices); i++ {
+		projection := vertices[i].Dot(axis)
+		if projection < min {
+			min = projection
+		}
+		if projection > max {
+			max = projection
+		}
 	}
 
-	delta := circlePos.Sub(closest)
-	distanceSquared := delta.MagnitudeSquared()
-	radiusSquared := circle.Radius * circle.Radius
+	return min, max
+}
 
-	if distanceSquared >= radiusSquared {
+func findContactPoints(verticesA, verticesB []Vector2D, normal Vector2D) []Vector2D {
+	var contacts []Vector2D
+
+	for _, vertex := range verticesA {
+		if isVertexInside(vertex, verticesB) {
+			contacts = append(contacts, vertex)
+		}
+	}
+
+	for _, vertex := range verticesB {
+		if isVertexInside(vertex, verticesA) {
+			contacts = append(contacts, vertex)
+		}
+	}
+
+	if len(contacts) > 2 {
+		contacts = contacts[:2]
+	}
+
+	return contacts
+}
+
+func isVertexInside(vertex Vector2D, polygon []Vector2D) bool {
+	return isPointInPolygon(vertex, polygon)
+}
+
+func detectCirclePolygon(circleBody, polygonBody *RigidBody, pool *ObjectPool) *CollisionManifold {
+	circlePos := circleBody.GetPosition()
+	circle := circleBody.shape.(*CircleShape)
+	polygonVertices := polygonBody.shape.GetVertices(polygonBody.GetPosition(), polygonBody.GetAngle())
+
+	var closestPoint Vector2D
+	var minDistanceSquared float64 = math.MaxFloat64
+
+	for i := 0; i < len(polygonVertices); i++ {
+		j := (i + 1) % len(polygonVertices)
+		closest := closestPointOnSegment(circlePos, polygonVertices[i], polygonVertices[j])
+		distSq := circlePos.DistanceSquared(closest)
+
+		if distSq < minDistanceSquared {
+			minDistanceSquared = distSq
+			closestPoint = closest
+		}
+	}
+
+	distance := math.Sqrt(minDistanceSquared)
+	if distance >= circle.Radius {
 		return nil
 	}
 
-	distance := math.Sqrt(distanceSquared)
 	penetration := circle.Radius - distance
-
 	var normal Vector2D
-	if distance > 0 {
-		invDistance := 1.0 / distance
-		normal = Vector2D{X: delta.X * invDistance, Y: delta.Y * invDistance}
-	} else {
-		xDist := math.Min(circlePos.X-(boxPos.X-halfW), (boxPos.X+halfW)-circlePos.X)
-		yDist := math.Min(circlePos.Y-(boxPos.Y-halfH), (boxPos.Y+halfH)-circlePos.Y)
 
-		if xDist < yDist {
-			if circlePos.X < boxPos.X {
-				normal = Vector2D{X: -1, Y: 0}
-			} else {
-				normal = Vector2D{X: 1, Y: 0}
-			}
-			penetration = xDist + circle.Radius
-		} else {
-			if circlePos.Y < boxPos.Y {
-				normal = Vector2D{X: 0, Y: -1}
-			} else {
-				normal = Vector2D{X: 0, Y: 1}
-			}
-			penetration = yDist + circle.Radius
-		}
+	if distance > 1e-8 {
+		normal = circlePos.Sub(closestPoint).Normalize()
+	} else {
+		normal = Vector2D{X: 1, Y: 0}
 	}
 
 	manifold := pool.GetManifold()
 	manifold.BodyA = circleBody
-	manifold.BodyB = boxBody
+	manifold.BodyB = polygonBody
 	manifold.Normal = normal
 	manifold.Penetration = penetration
-	manifold.ContactPoints = append(manifold.ContactPoints, closest)
-	manifold.Restitution = math.Min(circleBody.restitution, boxBody.restitution)
-	manifold.Friction = math.Sqrt(circleBody.friction * boxBody.friction)
+	manifold.ContactPoints = append(manifold.ContactPoints, closestPoint)
+	manifold.Restitution = math.Min(circleBody.restitution, polygonBody.restitution)
+	manifold.Friction = math.Sqrt(circleBody.friction * polygonBody.friction)
 
 	return manifold
+}
+
+func closestPointOnSegment(point, a, b Vector2D) Vector2D {
+	ab := b.Sub(a)
+	ap := point.Sub(a)
+
+	abSquared := ab.Dot(ab)
+	if abSquared == 0 {
+		return a
+	}
+
+	t := ap.Dot(ab) / abSquared
+
+	if t < 0 {
+		return a
+	}
+	if t > 1 {
+		return b
+	}
+
+	return a.Add(ab.Scale(t))
 }
 
 func ResolveCollision(manifold *CollisionManifold) {
@@ -1190,6 +1487,13 @@ func (pe *PhysicsEngine) AddBox(mass float64, position Vector2D, width, height f
 	return body
 }
 
+func (pe *PhysicsEngine) AddPolygon(mass float64, position Vector2D, vertices []Vector2D) *RigidBody {
+	shape := NewPolygonShape(vertices)
+	body := NewRigidBody(mass, position, shape)
+	pe.world.AddBody(body)
+	return body
+}
+
 func (pe *PhysicsEngine) SetGravity(gravity Vector2D) {
 	pe.world.gravity = gravity
 }
@@ -1281,9 +1585,10 @@ type BodyConfig struct {
 }
 
 type ShapeConfig struct {
-	Radius float64 `json:"radius,omitempty"`
-	Width  float64 `json:"width,omitempty"`
-	Height float64 `json:"height,omitempty"`
+	Radius   float64    `json:"radius,omitempty"`
+	Width    float64    `json:"width,omitempty"`
+	Height   float64    `json:"height,omitempty"`
+	Vertices []Vector2D `json:"vertices,omitempty"`
 }
 
 func LoadSceneFromFile(filename string) (*SceneConfig, error) {
@@ -1311,6 +1616,11 @@ func (pe *PhysicsEngine) LoadScene(config *SceneConfig) error {
 			body = pe.AddCircle(bodyConfig.Mass, bodyConfig.Position, bodyConfig.Shape.Radius)
 		case "box":
 			body = pe.AddBox(bodyConfig.Mass, bodyConfig.Position, bodyConfig.Shape.Width, bodyConfig.Shape.Height)
+		case "polygon":
+			if len(bodyConfig.Shape.Vertices) < 3 {
+				return fmt.Errorf("polygon must have at least 3 vertices")
+			}
+			body = pe.AddPolygon(bodyConfig.Mass, bodyConfig.Position, bodyConfig.Shape.Vertices)
 		default:
 			return fmt.Errorf("unknown body type: %s", bodyConfig.Type)
 		}
@@ -1379,7 +1689,7 @@ func parseFlags() *Config {
 	flag.StringVar(&config.ProfileMem, "profile-mem", "", "memory profile output file")
 	flag.StringVar(&config.SceneFile, "scene", "", "JSON scene file to load")
 	flag.IntVar(&config.BodiesCount, "bodies", 100, "number of bodies for generated scenes")
-	flag.StringVar(&config.SceneType, "scene-type", "default", "scene type (default, pyramid, rain, container)")
+	flag.StringVar(&config.SceneType, "scene-type", "default", "scene type (default, pyramid, rain, container, polygon)")
 	flag.Float64Var(&config.Damping, "damping", 0.999, "global damping factor")
 	flag.Float64Var(&config.Restitution, "restitution", 0.8, "default restitution")
 	flag.Float64Var(&config.Friction, "friction", 0.3, "default friction")
@@ -1434,7 +1744,7 @@ func validateConfig(config *Config) error {
 
 	validSceneTypes := map[string]bool{
 		"default": true, "pyramid": true, "rain": true,
-		"container": true, "pendulum": true, "mixed": true,
+		"container": true, "pendulum": true, "mixed": true, "polygon": true,
 	}
 	if !validSceneTypes[config.SceneType] {
 		return fmt.Errorf("invalid scene type: %s", config.SceneType)
@@ -1455,6 +1765,8 @@ func generateScene(engine *PhysicsEngine, config *Config) {
 		generatePendulumScene(engine, config.BodiesCount)
 	case "mixed":
 		generateMixedScene(engine, config.BodiesCount)
+	case "polygon":
+		generatePolygonScene(engine, config.BodiesCount)
 	default:
 		generateDefaultScene(engine, config.BodiesCount)
 	}
@@ -1467,16 +1779,80 @@ func generateDefaultScene(engine *PhysicsEngine, bodyCount int) {
 		x := (rand.Float64() - 0.5) * 150
 		y := rand.Float64()*50 + 50
 
-		if rand.Float64() < 0.6 {
+		shapeType := rand.Intn(3)
+		switch shapeType {
+		case 0:
 			radius := rand.Float64()*2 + 1
 			mass := radius * radius * math.Pi
 			engine.AddCircle(mass, NewVector2D(x, y), radius)
-		} else {
+		case 1:
 			size := rand.Float64()*3 + 1
 			mass := size * size
 			engine.AddBox(mass, NewVector2D(x, y), size, size)
+		case 2:
+			vertices := generateRandomPolygon(rand.Intn(4)+3, rand.Float64()*2+1)
+			mass := calculatePolygonArea(vertices)
+			engine.AddPolygon(mass, NewVector2D(x, y), vertices)
 		}
 	}
+}
+
+func generatePolygonScene(engine *PhysicsEngine, bodyCount int) {
+	engine.AddBox(0, NewVector2D(0, -50), 300, 10)
+
+	for i := 0; i < bodyCount; i++ {
+		x := (rand.Float64() - 0.5) * 200
+		y := rand.Float64()*80 + 30
+
+		sides := rand.Intn(5) + 3
+		radius := rand.Float64()*3 + 1
+		vertices := generateRegularPolygon(sides, radius)
+
+		mass := calculatePolygonArea(vertices) * 0.5
+		polygon := engine.AddPolygon(mass, NewVector2D(x, y), vertices)
+		polygon.restitution = rand.Float64()*0.5 + 0.3
+		polygon.friction = rand.Float64()*0.4 + 0.2
+	}
+}
+
+func generateRegularPolygon(sides int, radius float64) []Vector2D {
+	vertices := make([]Vector2D, sides)
+	angleStep := 2 * math.Pi / float64(sides)
+
+	for i := 0; i < sides; i++ {
+		angle := float64(i) * angleStep
+		vertices[i] = Vector2D{
+			X: radius * math.Cos(angle),
+			Y: radius * math.Sin(angle),
+		}
+	}
+
+	return vertices
+}
+
+func generateRandomPolygon(sides int, maxRadius float64) []Vector2D {
+	vertices := make([]Vector2D, sides)
+	angleStep := 2 * math.Pi / float64(sides)
+
+	for i := 0; i < sides; i++ {
+		angle := float64(i) * angleStep
+		radius := rand.Float64()*maxRadius + 0.5
+		vertices[i] = Vector2D{
+			X: radius * math.Cos(angle),
+			Y: radius * math.Sin(angle),
+		}
+	}
+
+	return vertices
+}
+
+func calculatePolygonArea(vertices []Vector2D) float64 {
+	area := 0.0
+	for i := 0; i < len(vertices); i++ {
+		j := (i + 1) % len(vertices)
+		area += vertices[i].Cross(vertices[j])
+	}
+	return math.Abs(area) * 0.5
 }
 
 func generatePyramidScene(engine *PhysicsEngine, bodyCount int) {
@@ -1489,7 +1865,12 @@ func generatePyramidScene(engine *PhysicsEngine, bodyCount int) {
 	for level := levels; level > 0; level-- {
 		for i := 0; i < level; i++ {
 			x := float64(i-level/2) * boxSize
-			engine.AddBox(1.0, NewVector2D(x, y), boxSize*0.9, boxSize*0.9)
+			if rand.Float64() < 0.5 {
+				engine.AddBox(1.0, NewVector2D(x, y), boxSize*0.9, boxSize*0.9)
+			} else {
+				vertices := generateRegularPolygon(rand.Intn(3)+4, boxSize*0.4)
+				engine.AddPolygon(1.0, NewVector2D(x, y), vertices)
+			}
 		}
 		y += boxSize
 	}
@@ -1504,15 +1885,21 @@ func generateRainScene(engine *PhysicsEngine, bodyCount int) {
 		x := (rand.Float64() - 0.5) * 250
 		y := rand.Float64()*200 + 100
 
-		if rand.Float64() < 0.7 {
+		shapeType := rand.Intn(3)
+		switch shapeType {
+		case 0:
 			radius := rand.Float64()*2 + 0.5
 			mass := radius * radius * math.Pi
 			engine.AddCircle(mass, NewVector2D(x, y), radius)
-		} else {
+		case 1:
 			width := rand.Float64()*3 + 1
 			height := rand.Float64()*3 + 1
 			mass := width * height
 			engine.AddBox(mass, NewVector2D(x, y), width, height)
+		case 2:
+			vertices := generateRandomPolygon(rand.Intn(4)+3, rand.Float64()*2+0.5)
+			mass := calculatePolygonArea(vertices)
+			engine.AddPolygon(mass, NewVector2D(x, y), vertices)
 		}
 	}
 }
@@ -1530,14 +1917,20 @@ func generateContainerScene(engine *PhysicsEngine, bodyCount int) {
 		x := (rand.Float64() - 0.5) * (containerWidth - 20)
 		y := rand.Float64()*60 + 10
 
-		if rand.Float64() < 0.6 {
+		shapeType := rand.Intn(3)
+		switch shapeType {
+		case 0:
 			radius := rand.Float64()*1.5 + 0.5
 			mass := radius * radius * math.Pi * 0.5
 			engine.AddCircle(mass, NewVector2D(x, y), radius)
-		} else {
+		case 1:
 			size := rand.Float64()*2 + 1
 			mass := size * size * 0.5
 			engine.AddBox(mass, NewVector2D(x, y), size, size)
+		case 2:
+			vertices := generateRegularPolygon(rand.Intn(4)+3, rand.Float64()*1.5+0.5)
+			mass := calculatePolygonArea(vertices) * 0.5
+			engine.AddPolygon(mass, NewVector2D(x, y), vertices)
 		}
 	}
 }
@@ -1550,8 +1943,15 @@ func generatePendulumScene(engine *PhysicsEngine, bodyCount int) {
 
 		bobY := 30.0
 		bobMass := 2.0
-		bob := engine.AddCircle(bobMass, NewVector2D(x, bobY), 1.5)
-		bob.ApplyForce(NewVector2D((rand.Float64()-0.5)*100, 0))
+
+		if rand.Float64() < 0.5 {
+			bob := engine.AddCircle(bobMass, NewVector2D(x, bobY), 1.5)
+			bob.ApplyForce(NewVector2D((rand.Float64()-0.5)*100, 0))
+		} else {
+			vertices := generateRegularPolygon(rand.Intn(4)+3, 1.2)
+			bob := engine.AddPolygon(bobMass, NewVector2D(x, bobY), vertices)
+			bob.ApplyForce(NewVector2D((rand.Float64()-0.5)*100, 0))
+		}
 	}
 }
 
@@ -1563,14 +1963,26 @@ func generateMixedScene(engine *PhysicsEngine, bodyCount int) {
 		x := (rand.Float64() - 0.5) * 150
 		y := float64(i)*15 - 20
 		width := rand.Float64()*30 + 20
-		engine.AddBox(0, NewVector2D(x, y), width, 3)
+
+		if rand.Float64() < 0.7 {
+			engine.AddBox(0, NewVector2D(x, y), width, 3)
+		} else {
+			vertices := []Vector2D{
+				{X: -width / 2, Y: -1.5},
+				{X: width / 2, Y: -1.5},
+				{X: width / 2, Y: 1.5},
+				{X: -width / 2, Y: 1.5},
+			}
+			engine.AddPolygon(0, NewVector2D(x, y), vertices)
+		}
 	}
 
 	for i := 0; i < bodyCount; i++ {
 		x := (rand.Float64() - 0.5) * 200
 		y := rand.Float64()*100 + 50
 
-		switch rand.Intn(3) {
+		shapeType := rand.Intn(4)
+		switch shapeType {
 		case 0:
 			radius := rand.Float64()*2 + 0.5
 			mass := radius * radius * math.Pi
@@ -1590,6 +2002,12 @@ func generateMixedScene(engine *PhysicsEngine, bodyCount int) {
 			box := engine.AddBox(mass, NewVector2D(x, y), width, height)
 			box.restitution = rand.Float64()*0.4 + 0.4
 			box.friction = rand.Float64()*0.5 + 0.4
+		case 3:
+			vertices := generateRandomPolygon(rand.Intn(4)+3, rand.Float64()*2+0.5)
+			mass := calculatePolygonArea(vertices)
+			polygon := engine.AddPolygon(mass, NewVector2D(x, y), vertices)
+			polygon.restitution = rand.Float64()*0.4 + 0.4
+			polygon.friction = rand.Float64()*0.5 + 0.3
 		}
 	}
 }
